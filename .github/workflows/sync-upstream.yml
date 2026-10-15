@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: sync-upstream
@@ -17,9 +17,10 @@ jobs:
   sync:
     if: github.repository == 'Kurisu0306/rea' && github.event.repository.fork
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
-      - name: Merge upstream into the default branch
+      - name: Resolve fork and upstream
+        id: repository
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -27,17 +28,49 @@ jobs:
         run: |
           set -euo pipefail
           metadata="$(gh api "repos/${GH_REPO}")"
-          branch="$(jq -er '.default_branch' <<< "$metadata")"
           upstream="$(jq -er '.parent.full_name' <<< "$metadata")"
-          echo "Syncing ${upstream} into ${GH_REPO}:${branch}"
-          # GitHub merges upstream commits and preserves fork-only commits.
-          # Conflicts or permission errors fail the job; never reset or force-push.
-          result="$(gh api --method POST "repos/${GH_REPO}/merge-upstream" -f "branch=${branch}")"
-          jq '{message, merge_type, base_branch}' <<< "$result"
+          upstream_branch="$(gh api "repos/${upstream}" --jq '.default_branch')"
           {
-            printf '### Upstream sync\n\n'
-            printf -- '- Fork: `%s`\n' "$GH_REPO"
-            printf -- '- Upstream: `%s`\n' "$upstream"
-            printf -- '- Branch: `%s`\n\n' "$branch"
-            jq -r '.message' <<< "$result"
+            printf 'branch=%s\n' "$(jq -er '.default_branch' <<< "$metadata")"
+            printf 'upstream=%s\n' "$upstream"
+            printf 'upstream_branch=%s\n' "$upstream_branch"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out fork with repository-scoped sync key
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ steps.repository.outputs.branch }}
+          fetch-depth: 0
+          ssh-key: ${{ secrets.REA_UPSTREAM_SYNC_KEY }}
+          persist-credentials: true
+
+      - name: Merge and push upstream updates
+        env:
+          DEFAULT_BRANCH: ${{ steps.repository.outputs.branch }}
+          UPSTREAM_REPO: ${{ steps.repository.outputs.upstream }}
+          UPSTREAM_BRANCH: ${{ steps.repository.outputs.upstream_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          upstream_commit="$(git rev-parse FETCH_HEAD)"
+          if git merge-base --is-ancestor "$upstream_commit" HEAD; then
+            printf 'Already up to date with `%s:%s` (`%s`).\n' \
+              "$UPSTREAM_REPO" "$UPSTREAM_BRANCH" "$upstream_commit" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Preserve fork-only commits. Conflicts fail without changing the remote.
+          # The merge commit skips unrelated push CI; scheduled/manual sync still runs.
+          git -c core.hooksPath=/dev/null merge --no-ff "$upstream_commit" \
+            -m "chore: sync upstream ${UPSTREAM_REPO}:${UPSTREAM_BRANCH} [skip ci]"
+          git -c core.hooksPath=/dev/null push origin "HEAD:refs/heads/${DEFAULT_BRANCH}"
+          {
+            printf '### Upstream sync completed\n\n'
+            printf -- '- Upstream: `%s:%s`\n' "$UPSTREAM_REPO" "$UPSTREAM_BRANCH"
+            printf -- '- Upstream commit: `%s`\n' "$upstream_commit"
+            printf -- '- Fork commit: `%s`\n' "$(git rev-parse HEAD)"
+            printf '\nFork-only commits were preserved.\n'
           } >> "$GITHUB_STEP_SUMMARY"
