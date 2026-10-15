@@ -1,0 +1,43 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # 08:17 Asia/Shanghai (UTC+8); avoid the busy top of the hour.
+    - cron: '17 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'Kurisu0306/rea' && github.event.repository.fork
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Merge upstream into the default branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata="$(gh api "repos/${GH_REPO}")"
+          branch="$(jq -er '.default_branch' <<< "$metadata")"
+          upstream="$(jq -er '.parent.full_name' <<< "$metadata")"
+          echo "Syncing ${upstream} into ${GH_REPO}:${branch}"
+          # GitHub merges upstream commits and preserves fork-only commits.
+          # Conflicts or permission errors fail the job; never reset or force-push.
+          result="$(gh api --method POST "repos/${GH_REPO}/merge-upstream" -f "branch=${branch}")"
+          jq '{message, merge_type, base_branch}' <<< "$result"
+          {
+            printf '### Upstream sync\n\n'
+            printf -- '- Fork: `%s`\n' "$GH_REPO"
+            printf -- '- Upstream: `%s`\n' "$upstream"
+            printf -- '- Branch: `%s`\n\n' "$branch"
+            jq -r '.message' <<< "$result"
+          } >> "$GITHUB_STEP_SUMMARY"
